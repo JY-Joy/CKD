@@ -1,0 +1,18 @@
+accelerate launch src/textual_inversion_distillation_gm.py \
+  --logging_dir /home/jenyuan/logs \
+  --output_dir /home/jenyuan/logs \
+  --pretrained_model_name_or_path /home/jenyuan/zoo/stable-diffusion-2-1-base \
+  --resolution=512 \
+  --learning_rate=5.0e-5 \
+  --seed=3467 \
+  --mixed_precision fp16 \
+  --learnable_property="object" \
+  --placeholder_token="<painting>" \
+  --initializer_token="painting" \
+  --train_batch_size 1 \
+  --gradient_accumulation_steps 1 \
+  --resume_from_checkpoint latest \
+  --checkpointing_steps 1000 \
+  --debug \
+  --use_copy_weight_from_teacher
+  --push_to_hub
