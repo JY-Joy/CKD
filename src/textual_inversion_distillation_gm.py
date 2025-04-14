@@ -1002,10 +1002,10 @@ def main():
                 loss = 1000 * loss_gm + loss_distill + student_loss
                 accelerator.backward(loss)
                 # total_grad_norm = accelerator.clip_grad_norm_(params_to_optimize, 1.0)
-                optimizer_unet.step()
-                lr_scheduler.step()
-                optimizer_unet.zero_grad()
-                # assert text_encoder.text_model.embeddings.token_embedding.grad is None
+                # optimizer_unet.step()
+                # lr_scheduler.step()
+                # optimizer_unet.zero_grad()
+                # text_encoder.text_model.embeddings.token_embedding.grad = None
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:

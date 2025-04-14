@@ -1,11 +1,12 @@
-accelerate launch src/textual_inversion_distillation_gm.py \
+accelerate launch src/ckd_train_sdxl.py \
   --logging_dir /home/jenyuan/logs \
   --output_dir /home/jenyuan/logs \
-  --pretrained_model_name_or_path /home/jenyuan/zoo/stable-diffusion-2-1-base \
-  --resolution=512 \
+  --pretrained_model_name_or_path /home/jenyuan/zoo/stable-diffusion-xl-base-1.0 \
+  --pruned_model_name_or_path /home/jenyuan/zoo/EcoDiffPrunedModels/model/sdxl/sdxl.pkl \
+  --train_size=1024 \
   --learning_rate=5.0e-5 \
   --seed=3467 \
-  --mixed_precision fp16 \
+  --mixed_precision bf16 \
   --learnable_property="object" \
   --placeholder_token="<painting>" \
   --initializer_token="painting" \
@@ -13,6 +14,5 @@ accelerate launch src/textual_inversion_distillation_gm.py \
   --gradient_accumulation_steps 1 \
   --resume_from_checkpoint latest \
   --checkpointing_steps 1000 \
-  --debug \
-  --use_copy_weight_from_teacher
+  --debug
   --push_to_hub

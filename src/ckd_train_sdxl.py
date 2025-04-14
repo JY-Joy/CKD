@@ -17,6 +17,9 @@ import argparse
 import logging
 import math
 import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import random
 import shutil
 import warnings
@@ -47,7 +50,7 @@ from datasets import load_dataset
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
-    DiffusionPipeline,
+    StableDiffusionXLPipeline,
     DPMSolverMultistepScheduler,
     StableDiffusionPipeline,
     UNet2DConditionModel,
@@ -56,6 +59,7 @@ from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.import_utils import is_xformers_available
+from diffusers.models.attention_processor import AttnProcessor
 
 
 if is_wandb_available():
@@ -89,52 +93,34 @@ if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("
 logger = get_logger(__name__)
 
 
-def copy_weight_from_teacher(unet_stu, unet_tea, student_type):
+def binary_mask_eval(args, model: str, pretrained_model_path="", pruned_model_path="", dtype=torch.float16):
 
-    connect_info = {} # connect_info['TO-student'] = 'FROM-teacher'
-    if student_type in ["bk_base", "bk_small"]:
-        connect_info['up_blocks.0.resnets.1.'] = 'up_blocks.0.resnets.2.'
-        connect_info['up_blocks.1.resnets.1.'] = 'up_blocks.1.resnets.2.'
-        connect_info['up_blocks.1.attentions.1.'] = 'up_blocks.1.attentions.2.'
-        connect_info['up_blocks.2.resnets.1.'] = 'up_blocks.2.resnets.2.'
-        connect_info['up_blocks.2.attentions.1.'] = 'up_blocks.2.attentions.2.'
-        connect_info['up_blocks.3.resnets.1.'] = 'up_blocks.3.resnets.2.'
-        connect_info['up_blocks.3.attentions.1.'] = 'up_blocks.3.attentions.2.'
-    elif student_type in ["bk_tiny"]:
-        connect_info['up_blocks.0.resnets.0.'] = 'up_blocks.1.resnets.0.'
-        connect_info['up_blocks.0.attentions.0.'] = 'up_blocks.1.attentions.0.'
-        connect_info['up_blocks.0.resnets.1.'] = 'up_blocks.1.resnets.2.'
-        connect_info['up_blocks.0.attentions.1.'] = 'up_blocks.1.attentions.2.'
-        connect_info['up_blocks.0.upsamplers.'] = 'up_blocks.1.upsamplers.'
-        connect_info['up_blocks.1.resnets.0.'] = 'up_blocks.2.resnets.0.'
-        connect_info['up_blocks.1.attentions.0.'] = 'up_blocks.2.attentions.0.'
-        connect_info['up_blocks.1.resnets.1.'] = 'up_blocks.2.resnets.2.'
-        connect_info['up_blocks.1.attentions.1.'] = 'up_blocks.2.attentions.2.'
-        connect_info['up_blocks.1.upsamplers.'] = 'up_blocks.2.upsamplers.'
-        connect_info['up_blocks.2.resnets.0.'] = 'up_blocks.3.resnets.0.'
-        connect_info['up_blocks.2.attentions.0.'] = 'up_blocks.3.attentions.0.'
-        connect_info['up_blocks.2.resnets.1.'] = 'up_blocks.3.resnets.2.'
-        connect_info['up_blocks.2.attentions.1.'] = 'up_blocks.3.attentions.2.'       
-    else:
-        raise NotImplementedError
+    model = model.lower()
+    # load sdxl model
+    pruned_pipe = StableDiffusionXLPipeline.from_pretrained(
+        pretrained_model_path, torch_dtype=dtype
+    ).to("cpu")
+    pruned_pipe.unet = torch.load(
+        pruned_model_path,
+        map_location="cpu",
+    )
 
+    # FLUX
+    # elif model == "flux":
+    #     pruned_pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16).to(
+    #         "cpu"
+    #     )
+    #     pruned_pipe.transformer = torch.load(
+    #         hf_hub_download("zhangyang-0123/EcoDiffPrunedModels", "model/flux/flux.pkl"),
+    #         map_location="cpu",
+    #     )
 
-    for k in unet_stu.state_dict().keys():
-        flag = 0
-        k_orig = k
-        for prefix_key in connect_info.keys():
-            if k.startswith(prefix_key):
-                flag = 1
-                k_orig = k_orig.replace(prefix_key, connect_info[prefix_key])            
-                break
+    # reload the original model
+    # elif model == "flux":
+    #     pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16).to("cpu")
 
-        if flag == 1:
-            print(f"** forced COPY {k_orig} -> {k}")
-        else:
-            print(f"normal COPY {k_orig} -> {k}")
-        unet_stu.state_dict()[k].copy_(unet_tea.state_dict()[k_orig])
-
-    return unet_stu
+    print("prune model loaded")
+    return pruned_pipe
 
 
 def log_validation(text_encoder, tokenizer, unet, vae, args, accelerator, weight_dtype, step):
@@ -202,10 +188,10 @@ def save_progress(text_encoder, placeholder_token_ids, accelerator, args, save_p
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument(
-        "--num_vectors",
+        "--num_tokens",
         type=int,
         default=1,
-        help="How many textual inversion vectors shall be used to learn the concept.",
+        help="How many textual inversion tokens to be inserted in caption.",
     )
     parser.add_argument(
         "--pretrained_model_name_or_path",
@@ -214,13 +200,11 @@ def parse_args():
         required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
-    parser.add_argument("--unet_config_path", type=str, default="./src/unet_config")     
-    parser.add_argument("--unet_config_name", type=str, default="bk_small", choices=["bk_base", "bk_small", "bk_tiny"])
+    parser.add_argument("--unet_config_path", type=str, default="./src/unet_config_v2-base/bk_small.yaml")
     parser.add_argument(
-        "--bk_model_name_or_path",
+        "--pruned_model_name_or_path",
         type=str,
         default=None,
-        required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
@@ -252,11 +236,9 @@ def parse_args():
         "--initializer_token", type=str, default=None, help="A token to use as initializer word."
     )
     parser.add_argument(
-        "--train_data_dir", type=str, default=None, required=True, help="A folder containing the training data."
+        "--train_data_dir", type=str, default=None, help="A folder containing the training data."
     )
-    parser.add_argument("--use_copy_weight_from_teacher", action="store_true", help="Whether to initialize unet student with teacher's weights",)
     parser.add_argument("--learnable_property", type=str, default="object", help="Choose between 'object' and 'style'")
-    parser.add_argument("--repeats", type=int, default=100, help="How many times to repeat the training data.")
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -265,13 +247,18 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
-        "--resolution",
+        "--train_size",
         type=int,
-        default=512,
+        default=1024,
         help=(
             "The resolution for input images, all the images in the train/validation dataset will be resized to this"
             " resolution"
         ),
+    )
+    parser.add_argument(
+        "--debug",
+        default=False,
+        action="store_true",
     )
     parser.add_argument(
         "--center_crop",
@@ -478,9 +465,6 @@ def parse_args():
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
-    if args.train_data_dir is None:
-        raise ValueError("You must specify a train data directory.")
-
     return args
 
 
@@ -603,47 +587,62 @@ def main():
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
     )
+    
+    bk_unet = torch.load(args.pruned_model_name_or_path, map_location="cpu", weights_only=False)
 
-    # FIXME: replace the code block below with the SDXL-lightning
-    if args.use_copy_weight_from_teacher:
-        config_student = UNet2DConditionModel.load_config(args.unet_config_path, subfolder=args.unet_config_name)
-        bk_unet = UNet2DConditionModel.from_config(config_student, revision=args.revision)
-        copy_weight_from_teacher(bk_unet, unet, args.unet_config_name)
-    else:
-        bk_unet = UNet2DConditionModel.from_pretrained(
-            args.bk_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
-        )
+    attn_procs = {}
+    for k,v in unet.attn_processors.items():
+        attn_procs[k] = AttnProcessor()
+    unet.set_attn_processor(attn_procs)
+    attn_procs = {}
+    for k,v in bk_unet.attn_processors.items():
+        attn_procs[k] = AttnProcessor()
+    bk_unet.set_attn_processor(attn_procs)
+
+    unet_param_count = 0
+    for param in unet.parameters():
+        unet_param_count += param.numel()
+    bk_unet_param_count = 0
+    for param in bk_unet.parameters():
+        bk_unet_param_count += param.numel()
+    logger.info(f"Unet param count: {unet_param_count / 1024 / 1024 / 1024} B")
+    logger.info(f"BK Unet param count: {bk_unet_param_count / 1024 / 1024 / 1024} B")
 
     if args.interpolate_text > 0 and args.placeholder_token is not None:
-
         # Add the placeholder token in tokenizer
         placeholder_tokens = [args.placeholder_token]
 
-        # add dummy tokens for multi-vector
-        additional_tokens = []
-        for i in range(1, args.train_batch_size):
-            additional_tokens.append(f"{args.placeholder_token}_{i}")
-        placeholder_tokens += additional_tokens
+        # if args.num_tokens < 1:
+        #     raise ValueError(f"--num_tokens has to be larger or equal to 1, but is {args.num_tokens}")
+        #     # add dummy tokens for multi-vector
+        #     additional_tokens = []
+        #     for i in range(1, args.train_batch_size):
+        #         additional_tokens.append(f"{args.placeholder_token}_{i}")
+        #     placeholder_tokens += additional_tokens
+        # num_added_tokens = tokenizer.add_tokens(placeholder_tokens)
+        # if num_added_tokens != args.train_batch_size:
+        #     raise ValueError(
+        #         f"The tokenizer already contains the token {args.placeholder_token}. Please pass a different"
+        #         " `placeholder_token` that is not already in the tokenizer."
+        #     )
 
-        num_added_tokens = tokenizer_1.add_tokens(placeholder_tokens)
-        if num_added_tokens != args.train_batch_size:
-            raise ValueError(
-                f"The tokenizer already contains the token {args.placeholder_token}. Please pass a different"
-                " `placeholder_token` that is not already in the tokenizer."
-            )
-        num_added_tokens = tokenizer_2.add_tokens(placeholder_tokens)
-        if num_added_tokens != args.train_batch_size:
-            raise ValueError(
-                f"The 2nd tokenizer already contains the token {args.placeholder_token}. Please pass a different"
-                " `placeholder_token` that is not already in the tokenizer."
-            )
+        # Convert the initializer_token, placeholder_token to ids
+        # token_ids = tokenizer.encode(args.initializer_token, add_special_tokens=False)
+        # Check if initializer_token is a single token or a sequence of tokens
+        # if len(token_ids) > 1:
+        #     raise ValueError("The initializer token must be a single token.")
 
-        placeholder_token_ids = tokenizer_1.convert_tokens_to_ids(placeholder_tokens)
-        placeholder_token_ids_2 = tokenizer_2.convert_tokens_to_ids(placeholder_tokens)
+        # initializer_token_id = token_ids[0]
+        placeholder_token_ids = tokenizer.convert_tokens_to_ids(placeholder_tokens)
 
         # Resize the token embeddings as we are adding new special tokens to the tokenizer
-        text_encoder_1.resize_token_embeddings(len(tokenizer_1))
-        text_encoder_2.resize_token_embeddings(len(tokenizer_2))
+        text_encoder.resize_token_embeddings(len(tokenizer))
+
+        # # Initialise the newly added placeholder token with the embeddings of the initializer token
+        token_embeds = text_encoder.get_input_embeddings().weight.data
+        # with torch.no_grad():
+        #     for token_id in placeholder_token_ids:
+        #         token_embeds[token_id] = token_embeds[initializer_token_id].clone()
 
     # Freeze vae and unet
     vae.requires_grad_(False)
@@ -651,7 +650,7 @@ def main():
     text_encoder_1.requires_grad_(False)
     text_encoder_2.requires_grad_(False)
 
-    # FIXME: deprecated?
+    # FIXME: deprecated? gradient matching on token_embedding level
     # text_encoder.text_model.embeddings.token_embedding.requires_grad_(True)
 
     if args.gradient_checkpointing:
@@ -685,7 +684,7 @@ def main():
             args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
 
-    # Loss function for gradient matching
+    # Loss function
     loss_fn = torch.nn.CosineSimilarity(dim=-1, eps=1e-6)
 
     # Initialize the optimizer
@@ -699,14 +698,24 @@ def main():
     )
 
     # Dataset and DataLoaders creation:
-    train_dataset = load_dataset(
-        args.train_data_dir,
-        data_dir=args.train_data_dir,
-        cache_dir=f"{args.train_data_dir}/.cache",
-        num_proc=8,
-        split="train",
-        trust_remote_code=True
-    )
+    if args.debug:
+        from datasets import Dataset
+        def dummy_data_generator():
+            for i in range(100):
+                yield {
+                    "res": args.train_size,
+                    "caption": "",
+                }
+        train_dataset = Dataset.from_generator(dummy_data_generator)
+    else:
+        train_dataset = load_dataset(
+            args.train_data_dir,
+            data_dir=args.train_data_dir,
+            cache_dir=f"{args.train_data_dir}/.cache",
+            num_proc=8,
+            split="train",
+            trust_remote_code=True
+        )
 
     # Preprocessing the datasets.
     column_names = train_dataset.column_names
@@ -727,26 +736,73 @@ def main():
                 raise ValueError(
                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
                 )
-        inputs = tokenizer(
-            captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
-        )
-        return inputs.input_ids
+        input_ids_1 = tokenizer_1(
+            captions,
+            padding="max_length",
+            truncation=True,
+            max_length=tokenizer_1.model_max_length,
+            return_tensors="pt"
+        ).input_ids
+        
+        input_ids_2 = tokenizer_2(
+            captions,
+            padding="max_length",
+            truncation=True,
+            max_length=tokenizer_2.model_max_length,
+            return_tensors="pt"
+        ).input_ids
+        return input_ids_1, input_ids_2
 
     # Preprocessing the datasets.
     train_transforms = transforms.Compose(
         [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
             transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
         ]
     )
+    train_crop = transforms.CenterCrop(args.train_size) if args.center_crop else transforms.RandomCrop(args.train_size)
 
     def preprocess_train(examples):
-        images = [Image.open(image).convert("RGB") for image in examples[image_column]]
-        examples["pixel_values"] = [train_transforms(image) for image in images]
-        examples["input_ids"] = tokenize_captions(examples)
+        if args.debug:
+            examples["pixel_values"] = [torch.randn(3,res,res) for res in examples[image_column]]
+            examples["original_size"] = [(1024, 1024) for _ in examples[image_column]]
+            examples["crop_top_left"] = [(0, 0) for _ in examples[image_column]]
+        else:
+            images = []
+            original_size = []
+            crop_top_left = []
+            for image in examples[image_column]:
+                if isinstance(image, PIL.Image.Image):
+                    if not image.mode == "RGB":
+                        image = image.convert("RGB")
+                elif isinstance(image, str):
+                    image = Image.open(image)
+                    if not image.mode == "RGB":
+                        image = image.convert("RGB")
+                else:
+                    raise ValueError(
+                        f"Image column `{image_column}` should contain either PIL images or lists of images."
+                    )
+                original_size.append((image.height, image.width))
+                image = image.resize((args.train_size, args.train_size), resample=args.interpolation)
+                if args.center_crop:
+                    y1 = max(0, int(round((image.height - args.train_size) / 2.0)))
+                    x1 = max(0, int(round((image.width - args.train_size) / 2.0)))
+                    image = train_crop(image)
+                else:
+                    y1, x1, h, w = train_crop.get_params(image, (args.train_size, args.train_size))
+                    image = transforms.functional.crop(image, y1, x1, h, w)
+
+                crop_top_left.append((y1, x1))
+                image = train_transforms(image)
+                images.append(image)
+            examples["pixel_value"] = images
+            examples["original_size"] = original_size
+            examples["crop_top_left"] = crop_top_left
+        input_ids = tokenize_captions(examples)
+        examples["input_ids_1"] = input_ids[0]
+        examples["input_ids_2"] = input_ids[1]
         return examples
 
     with accelerator.main_process_first():
@@ -756,8 +812,19 @@ def main():
     def collate_fn(examples):
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-        input_ids = torch.stack([example["input_ids"] for example in examples])
-        return {"pixel_values": pixel_values, "input_ids": input_ids}
+        input_ids_1 = torch.stack([example["input_ids_1"] for example in examples])
+        input_ids_1 = input_ids_1.to(memory_format=torch.contiguous_format).long()
+        input_ids_2 = torch.stack([example["input_ids_2"] for example in examples])
+        input_ids_2 = input_ids_2.to(memory_format=torch.contiguous_format).long()
+        original_size = [example["original_size"] for example in examples]
+        crop_top_left = [example["crop_top_left"] for example in examples]
+        return {
+            "pixel_values": pixel_values,
+            "input_ids_1": input_ids_1,
+            "input_ids_2": input_ids_2,
+            "original_size": original_size,
+            "crop_top_left": crop_top_left,
+        }
 
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
@@ -905,7 +972,33 @@ def main():
 
                 # Get the text embedding for conditioning
                 with torch.no_grad():
-                    encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                    # Get the text embedding for conditioning
+                    encoder_hidden_states_1 = (
+                        text_encoder_1(batch["input_ids_1"], output_hidden_states=True)
+                        .hidden_states[-2]
+                        .to(dtype=weight_dtype)
+                    )
+                    encoder_output_2 = text_encoder_2(batch["input_ids_2"], output_hidden_states=True)
+                    encoder_hidden_states_2 = encoder_output_2.hidden_states[-2].to(dtype=weight_dtype)
+                    original_size = [
+                        (batch["original_size"][i][0].item(), batch["original_size"][i][1].item())
+                        for i in range(args.train_batch_size)
+                    ]
+                    crop_top_left = [
+                        (batch["crop_top_left"][0][i].item(), batch["crop_top_left"][1][i].item())
+                        for i in range(args.train_batch_size)
+                    ]
+                    target_size = (args.resolution, args.resolution)
+                    add_time_ids = torch.cat(
+                        [
+                            torch.tensor(original_size[i] + crop_top_left[i] + target_size)
+                            for i in range(args.train_batch_size)
+                        ]
+                    ).to(accelerator.device, dtype=weight_dtype)
+                    print(add_time_ids.shape)
+                    exit()
+                    added_cond_kwargs = {"text_embeds": encoder_output_2[0], "time_ids": add_time_ids}
+                    encoder_hidden_states = torch.cat([encoder_hidden_states_1, encoder_hidden_states_2], dim=-1)
                     if args.interpolate_text > 0:
                         invert_captions = []
                         for ph_token_id, ph_token in zip(placeholder_token_ids, placeholder_tokens):
@@ -926,9 +1019,6 @@ def main():
                     else:
                         noisy_encoder_hidden_states = encoder_hidden_states.to(dtype=weight_dtype)
                         noisy_encoder_hidden_states.requires_grad = True
-
-                    encoder_hidden_states = encoder_hidden_states.to(dtype=weight_dtype)
-                    encoder_hidden_states.requires_grad = True
 
                 # Gradient Matching
                 for _ in range(args.gm_batch):
@@ -957,17 +1047,12 @@ def main():
                     teacher_loss = F.mse_loss(teacher_pred.float(), target.float(), reduction="mean")
 
                     # Gradient Matching
-                    target_gradient = torch_grad(outputs=teacher_loss, inputs=noisy_encoder_hidden_states,
-                                                create_graph=True,
-                                                retain_graph=True, only_inputs=True
-                                    )[0]
+                    target_gradient = torch_grad(outputs=teacher_loss, inputs=noisy_encoder_hidden_states)[0]
                     student_pred = bk_unet(noisy_latents, timesteps, noisy_encoder_hidden_states).sample
                     student_loss = F.mse_loss(student_pred.float(), target.float(), reduction="mean")
-
                     student_gradient = torch_grad(outputs=student_loss, inputs=noisy_encoder_hidden_states,
-                                                create_graph=True,
-                                                retain_graph=True, only_inputs=True
-                                    )[0]
+                                                create_graph=True, retain_graph=True, only_inputs=True
+                                        )[0]
 
                     # mse similarity
                     sim = F.mse_loss(student_gradient.float(), target_gradient.float(), reduction="mean")
@@ -976,17 +1061,18 @@ def main():
                     # cosine similarity
                     # sim = loss_fn(student_gradient.float(), target_gradient.float())
                     # loss_gm = (1 - sim).mean() / args.gm_batch
-                    accelerator.backward(loss_gm)  # maximize the similarity
-                # accelerator.clip_grad_norm_(params_to_optimize, 1.0)
+                    # accelerator.backward(loss_gm)  # maximize the similarity
 
-                # # Diffusion Loss
+                # Diffusion Loss
                 # student_pred = bk_unet(noisy_latents, timesteps, encoder_hidden_states).sample
-                # student_loss = F.mse_loss(student_pred.float(), target.float(), reduction="mean")
-                # accelerator.backward(student_loss)
+                loss_distill = F.mse_loss(student_pred.float(), teacher_pred.detach().float(), reduction="mean")
+                loss = 1000 * loss_gm + loss_distill + student_loss
+                accelerator.backward(loss)
+                # total_grad_norm = accelerator.clip_grad_norm_(params_to_optimize, 1.0)
                 # optimizer_unet.step()
                 # lr_scheduler.step()
                 # optimizer_unet.zero_grad()
-                # # text_encoder.text_model.embeddings.token_embedding.grad = None
+                # text_encoder.text_model.embeddings.token_embedding.grad = None
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
