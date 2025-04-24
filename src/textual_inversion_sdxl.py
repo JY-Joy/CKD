@@ -656,9 +656,12 @@ def main():
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
     )
-    unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
-    )
+    # unet = UNet2DConditionModel.from_pretrained(
+    #     args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
+    # )
+    unet = torch.load("/root/zoo/EcoDiffPrunedModels/model/sdxl/sdxl.pkl", map_location="cpu", weights_only=False)
+    text_encoder_1.text_model.eos_token_id = tokenizer_1.eos_token_id
+    text_encoder_2.text_model.eos_token_id = tokenizer_2.eos_token_id
 
     # Add the placeholder token in tokenizer_1
     placeholder_tokens = [args.placeholder_token]
@@ -825,7 +828,13 @@ def main():
     # Move vae and unet and text_encoder_2 to device and cast to weight_dtype
     unet.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
-    text_encoder_2.to(accelerator.device, dtype=weight_dtype)
+    # text_encoder_2.to(accelerator.device)
+    text_encoder_1.text_model.encoder.to(dtype=weight_dtype)
+    text_encoder_1.text_model.final_layer_norm.to(dtype=weight_dtype)
+    text_encoder_1.text_model.embeddings.position_embedding.to(dtype=weight_dtype)
+    text_encoder_2.text_model.encoder.to(dtype=weight_dtype)
+    text_encoder_2.text_model.final_layer_norm.to(dtype=weight_dtype)
+    text_encoder_2.text_model.embeddings.position_embedding.to(dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)

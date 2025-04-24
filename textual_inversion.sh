@@ -1,5 +1,5 @@
 accelerate launch src/textual_inversion.py \
-  --pretrained_model_name_or_path /apdcephfs_cq10/share_916081/jentsehuang/models/stable-diffusion-2-1-base \
+  --pretrained_model_name_or_path /home/jenyuan/zoo/stable-diffusion-xl-base-1.0 \
   --train_data_dir /apdcephfs_cq8/share_916081/jentsehuang/textual_inversion/input/starry_night \
   --resolution=512 \
   --learning_rate=5.0e-04 \

@@ -261,6 +261,15 @@ def parse_args():
         action="store_true",
     )
     parser.add_argument(
+        "--interpolation",
+        type=str,
+        default="bicubic",
+        help=(
+            'The integration to report the results and logs to. Supported platforms are `"tensorboard"`'
+            ' (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
+        ),
+    )
+    parser.add_argument(
         "--center_crop",
         default=False,
         action="store_true",
@@ -648,10 +657,7 @@ def main():
     vae.requires_grad_(False)
     unet.requires_grad_(False)
     text_encoder_1.requires_grad_(False)
-    text_encoder_2.requires_grad_(False)
-
-    # FIXME: deprecated? gradient matching on token_embedding level
-    # text_encoder.text_model.embeddings.token_embedding.requires_grad_(True)
+    text_encoder_2.requires_grad_(False)    # TODO: test gradient flow from `add_time_ids`, this requires modify `CLIP_TextProjection` model forward for penultimate hidden states requiring grad
 
     if args.gradient_checkpointing:
         # Keep unet in train mode if we are using gradient checkpointing to save memory.
@@ -704,12 +710,12 @@ def main():
             for i in range(100):
                 yield {
                     "res": args.train_size,
-                    "caption": "",
+                    "caption": "a photo of an object",
                 }
         train_dataset = Dataset.from_generator(dummy_data_generator)
     else:
         train_dataset = load_dataset(
-            args.train_data_dir,
+            "imagefolder",
             data_dir=args.train_data_dir,
             cache_dir=f"{args.train_data_dir}/.cache",
             num_proc=8,
@@ -762,6 +768,12 @@ def main():
         ]
     )
     train_crop = transforms.CenterCrop(args.train_size) if args.center_crop else transforms.RandomCrop(args.train_size)
+    args.interpolation = {
+        "linear": PIL_INTERPOLATION["linear"],
+        "bilinear": PIL_INTERPOLATION["bilinear"],
+        "bicubic": PIL_INTERPOLATION["bicubic"],
+        "lanczos": PIL_INTERPOLATION["lanczos"],
+    }[args.interpolation]
 
     def preprocess_train(examples):
         if args.debug:
@@ -797,7 +809,7 @@ def main():
                 crop_top_left.append((y1, x1))
                 image = train_transforms(image)
                 images.append(image)
-            examples["pixel_value"] = images
+            examples["pixel_values"] = images
             examples["original_size"] = original_size
             examples["crop_top_left"] = crop_top_left
         input_ids = tokenize_captions(examples)
@@ -900,7 +912,7 @@ def main():
     vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder_1.to(accelerator.device, dtype=weight_dtype)
     text_encoder_2.to(accelerator.device, dtype=weight_dtype)
-    bk_unet.to(accelerator.device)
+    bk_unet.to(accelerator.device, dtype=torch.float32)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -980,23 +992,15 @@ def main():
                     )
                     encoder_output_2 = text_encoder_2(batch["input_ids_2"], output_hidden_states=True)
                     encoder_hidden_states_2 = encoder_output_2.hidden_states[-2].to(dtype=weight_dtype)
-                    original_size = [
-                        (batch["original_size"][i][0].item(), batch["original_size"][i][1].item())
-                        for i in range(args.train_batch_size)
-                    ]
-                    crop_top_left = [
-                        (batch["crop_top_left"][0][i].item(), batch["crop_top_left"][1][i].item())
-                        for i in range(args.train_batch_size)
-                    ]
-                    target_size = (args.resolution, args.resolution)
-                    add_time_ids = torch.cat(
+                    original_size = batch["original_size"]
+                    crop_top_left = batch["crop_top_left"]
+                    target_size = (args.train_size, args.train_size)
+                    add_time_ids = torch.stack(
                         [
                             torch.tensor(original_size[i] + crop_top_left[i] + target_size)
                             for i in range(args.train_batch_size)
                         ]
                     ).to(accelerator.device, dtype=weight_dtype)
-                    print(add_time_ids.shape)
-                    exit()
                     added_cond_kwargs = {"text_embeds": encoder_output_2[0], "time_ids": add_time_ids}
                     encoder_hidden_states = torch.cat([encoder_hidden_states_1, encoder_hidden_states_2], dim=-1)
                     if args.interpolate_text > 0:
@@ -1043,12 +1047,12 @@ def main():
                         raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
                     # # Diffusion Loss
-                    teacher_pred = unet(noisy_latents, timesteps, noisy_encoder_hidden_states).sample
+                    teacher_pred = unet(noisy_latents, timesteps, noisy_encoder_hidden_states, added_cond_kwargs=added_cond_kwargs).sample
                     teacher_loss = F.mse_loss(teacher_pred.float(), target.float(), reduction="mean")
 
                     # Gradient Matching
                     target_gradient = torch_grad(outputs=teacher_loss, inputs=noisy_encoder_hidden_states)[0]
-                    student_pred = bk_unet(noisy_latents, timesteps, noisy_encoder_hidden_states).sample
+                    student_pred = bk_unet(noisy_latents, timesteps, noisy_encoder_hidden_states, added_cond_kwargs=added_cond_kwargs).sample
                     student_loss = F.mse_loss(student_pred.float(), target.float(), reduction="mean")
                     student_gradient = torch_grad(outputs=student_loss, inputs=noisy_encoder_hidden_states,
                                                 create_graph=True, retain_graph=True, only_inputs=True
